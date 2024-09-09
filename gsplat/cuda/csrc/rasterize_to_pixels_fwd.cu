@@ -157,10 +157,22 @@ __global__ void rasterize_to_pixels_fwd_kernel(
             int32_t g = id_batch[t];
             const S vis = alpha * T;
             const S *c_ptr = colors + g * COLOR_DIM;
-            GSPLAT_PRAGMA_UNROLL
-            for (uint32_t k = 0; k < COLOR_DIM; ++k) {
-                pix_out[k] += c_ptr[k] * vis;
+
+            /* Old version alpha blends color and depth 
+             * GSPLAT_PRAGMA_UNROLL
+             * for (uint32_t k = 0; k < COLOR_DIM; ++k) {
+             *     pix_out[k] += c_ptr[k] * vis;
+             * }
+             */
+            // printf("Pixel %u of batch %u has opacity %f and depth %f\n", pix_id, t, opac, c_ptr[3]);
+            pix_out[0] += c_ptr[0] * vis;
+            pix_out[1] += c_ptr[1] * vis;
+            pix_out[2] += c_ptr[2] * vis;
+            if (pix_out[3] == 0.f && opac > 0.7f) {
+                // printf("Setting depth of pixel %u of batch %u to %f\n", pix_id, t, c_ptr[3]);
+                pix_out[3] = c_ptr[3];
             }
+
             cur_idx = batch_start + t;
 
             T = next_T;
