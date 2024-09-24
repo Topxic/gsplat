@@ -24,9 +24,8 @@ from .distributed import (
 )
 
 
-DEBUG_DEPTH_MASKS = True
-DEBUG_DEPTH = True
-
+DEBUG_DEPTH_MASKS = False
+DEBUG_NORMAL_AND_DEPTH = False
 
 def rasterization(
     means: Tensor,  # [N, 3]
@@ -466,8 +465,9 @@ def rasterization(
             depths = depths.reshape(C, -1)
             conics = conics.reshape(C, -1, 3)
             opacities = opacities.reshape(C, -1)
-            colors = colors.reshape(C, -1, colors.shape[-1])          
-
+            colors = colors.reshape(C, -1, colors.shape[-1])     
+                 
+    # Calculate depths and normals like https://gapszju.github.io/RTG-SLAM/static/pdfs/RTG-SLAM_arxiv.pdf
     # Pass per gaussian normals and positions to the rasterizer and select values of frontest opaque gaussian
     # Color is rednered normally via alpha blending 
     # Normal is rendered by selecting the frontest opaque gaussian orientation
@@ -476,19 +476,13 @@ def rasterization(
         # Compute per gaussian normal by applying the quaternion rotation to the z-axis
         normals = torch.zeros((N, 3), device=device)  # [N, 3]
         normals[:, 2] = 1
+        
         # Convert quaternion to rotation matrix
-        quats = F.normalize(quats, dim=-1)
         rotmats = normalized_quat_to_rotmat(quats)  # [N, 3, 3]
+        
         # Batch matrix multiplication for batched inputs [N, 3, 3] * [N, 3, 1]
         normals = torch.bmm(rotmats, normals.unsqueeze(-1)).squeeze(-1)  # [N, 3]
-        # Make normals always point towards viewer
-        cam_to_world = torch.inverse(viewmats)  # [C, 4, 4] (T_g)
-        view_dir_cam_space = torch.tensor([0, 0, 1, 0]).float().to(viewmats.device)
-        view_dir_world_space = torch.einsum('cij,j->i', cam_to_world, view_dir_cam_space)
-        view_dir_world_space = view_dir_world_space[:3]
-        view_dir_world_space = view_dir_world_space / torch.linalg.norm(view_dir_world_space)
-        need_to_flip = torch.sum(view_dir_world_space * normals.clone(), dim=-1) > 0 
-        normals[need_to_flip] *= -1
+
         # Normalize normals
         normals = F.normalize(normals, dim=-1)
         normals = normals.expand(C, -1, -1)  # [C, N, 3]
@@ -592,81 +586,103 @@ def rasterization(
         )
         
     if render_mode == "RGB+D+N":
-        # Calculate depth https://gapszju.github.io/RTG-SLAM/static/pdfs/RTG-SLAM_arxiv.pdf
-        ones = torch.ones(C, height, width, 1).float().to(viewmats.device)
-        
+        # Calculate depths and normals like https://gapszju.github.io/RTG-SLAM/static/pdfs/RTG-SLAM_arxiv.pdf
+
         # Obtain positions and normals after rasterization
         positions = render_colors[..., -6:-3]  # [C, H, W, 3] (p_j^r)
         # Homogenize positions vectors
+        ones = torch.ones(C, height, width, 1).float().to(viewmats.device)
         positions_h = torch.cat((positions, ones), dim=-1)
-        normals = render_colors[..., -3:]  # [C, H, W, 3]
+        rasterized_normals = render_colors[..., -3:]  # [C, H, W, 3]
               
         # Prepare terms for depth by disk view ray intersection 
         cam_to_world = torch.inverse(viewmats)  # [C, 4, 4] (T_g)
         rot = cam_to_world[:, :3, :3]  # [C, 3, 3] (R_g)
         trans = cam_to_world[:, :3, 3]  # [C, 3] (t_g)
         Ks_inv = torch.inverse(Ks)  # [C, 3, 3] (K^{-1})
-        u_coords, v_coords = torch.meshgrid(  # [H, W], [H, W]
+        v_coords, u_coords = torch.meshgrid(  # [H], [W]
             torch.arange(height, device=device), 
             torch.arange(width, device=device),
             indexing='ij')
+        u_coords = width - u_coords
+        v_coords = height - v_coords
         image_coords = torch.stack([u_coords, v_coords, torch.ones_like(u_coords)], dim=-1).float()  # [H, W, 3]
         image_coords = image_coords.unsqueeze(0).expand(C, -1, -1, -1)  # [C, H, W, 3]
         
-        # Equation 4
+        # ==================================== Equation 4 ====================================
         ray_dir = torch.einsum('cij,chwj->chwi', Ks_inv, image_coords)  # [C, H, W, 3]
         ray_dir = torch.einsum('cij,chwj->chwi', rot, ray_dir)  # [C, H, W, 3] (R_g K^{-1}u)
-        norm = torch.linalg.norm(ray_dir, dim=-1, keepdim=True)
-        ray_dir = ray_dir / norm # Normalize      
-        trans = trans.unsqueeze(1).unsqueeze(1).expand(-1, height, width, -1)  # [C, H, W, 3] (t_g)
-        ray_length = positions.clone()
-        ray_length = ray_length - trans
-        ray_length = ray_length * normals.clone()
-        ray_length = torch.sum(ray_length, dim=-1)  # [C, H, W, 1] (theta_u)
+        ray_dir = F.normalize(ray_dir, dim=-1)
+
+        # Counter of ray plane intersection
+        trans = trans.unsqueeze(1).unsqueeze(1).expand(C, height, width, -1)  # [C, H, W, 3] (t_g)
+        ray_length_count = positions.clone()
+        ray_length_count = ray_length_count - trans
+        ray_length_count = ray_length_count * rasterized_normals.clone()
+        ray_length_count = torch.sum(ray_length_count, dim=-1)  # [C, H, W, 1] (theta_u)
+        
+        # Denominator of ray plane intersection
         ray_length_denom = ray_dir.clone()
-        ray_length_denom = ray_length_denom * normals.clone()
+        ray_length_denom = ray_length_denom * rasterized_normals.clone()
         ray_length_denom = torch.sum(ray_length_denom, dim=-1)
-        ray_length_denom = torch.clamp(ray_length_denom, min=1e-8)
-        ray_length = ray_length / ray_length_denom
-        intersections = ray_dir * ray_length.unsqueeze(-1) + trans  # [C, H, W, 3] (p_{G_j^r,r})
+        ray_length_denom[ray_length_denom == 0] = 1e-8  # TODO Define eps
+        ray_length = ray_length_count / ray_length_denom
+        
+        intersections = ray_dir.clone() * ray_length.unsqueeze(-1) + trans  # [C, H, W, 3] (p_{G_j^r,r})
         # Homogenize intersection vectors
         intersections_h = torch.cat((intersections, ones), dim=-1)
    
-        # Equation 5
+        # ==================================== Equation 5 ====================================
         depths = torch.zeros((C, height, width, 1), device=device).float()  # [C, H, W, 1]
         # Set depth to -1 where no intersection happened (= normal is 0)
-        no_intersection_mask = normals.norm(dim=-1) == 0
-        #depths[no_intersection_mask] = -1 TODO comment in
-        # Angle between normal and ray_dir < 60 degrees
-        angle_mask = torch.sum(normals * ray_dir, dim=-1) > math.cos(60)
+        no_intersection_mask = rasterized_normals.norm(dim=-1) == 0
+        depths[no_intersection_mask] = -1
+        
+        # Only set if angle between normal and ray_dir < 60 degrees
+        angle_mask = torch.acos(torch.sum(rasterized_normals * ray_dir.clone(), dim=-1)) < (60 * math.pi / 180)  # TODO Extract parameter
+        # Also exclude pixels where ray points away from plane
+        # https://math.stackexchange.com/questions/4402134/determining-plane-intersection-with-a-ray
+        angle_mask = torch.logical_and(angle_mask, torch.logical_not(torch.logical_and(ray_length_count < 0, ray_length_denom >= 0)))
+        angle_mask = torch.logical_and(angle_mask, torch.logical_not(torch.logical_and(ray_length_count > 0, ray_length_denom <= 0)))
         # Exclude pixels that didn't hit a gaussian
         angle_mask = torch.logical_and(angle_mask, torch.logical_not(no_intersection_mask))
         intersections_img_space = torch.einsum('cij,chwj->chwi', viewmats, intersections_h)
         depths[angle_mask.unsqueeze(-1)] = intersections_img_space[angle_mask][:, 2]  # (T^{-1}_g * p_{G_j^r,r}).z
+
         # Otherwise
         otherwise = torch.logical_not(torch.logical_or(no_intersection_mask, angle_mask))
         positions_image_space = torch.einsum('cij,chwj->chwi', viewmats, positions_h)
-        #depths[otherwise.unsqueeze(-1)] = positions_image_space[otherwise][:, 2]  # (T^{-1}_g * p_j^r).z TODO comment in
-               
-        if DEBUG_DEPTH:
-            import matplotlib.pyplot as plt
-            
-            # Convert masks to numpy arrays
-            debug_img = depths.detach().cpu().numpy()  # [C, H, W]
-            # Number of images per mask
-            num_images = debug_img.shape[0]
-
-            # Create a figure with subplots
-            fig, axes = plt.subplots(num_images, 1, figsize=(15, 5 * num_images))
-            for i in range(num_images):
-                # Plot no_intersection_mask images
-                axes[i].imshow(debug_img[i], cmap='gray', vmin=0, vmax=1)
-                axes[i].set_title(f'Normal dependant depth - {i}')
-                axes[i].axis('off')       
-               
+        depths[otherwise.unsqueeze(-1)] = positions_image_space[otherwise][:, 2]  # (T^{-1}_g * p_j^r).z 
+        
+        # Calculate normals from rendered depth
+        depths_world_space = ray_dir.clone() * depths + trans
+        depths_world_space = torch.einsum('cij,chwj->chwi', rot, depths_world_space)
+        
+        # Calculate the gradient of the 3D positions
+        dx = F.normalize(depths_world_space[:, 1:, :-1, :] - depths_world_space[:, :-1, :-1, :], dim=-1)
+        dy = F.normalize(depths_world_space[:, :-1, 1:, :] - depths_world_space[:, :-1, :-1, :], dim=-1)
+        
+        # Compute normals via cross product of dx and dy
+        calculated_normals = torch.cross(dx, dy, dim=-1)  # [C, H-1, W-1, 3]
+        calculated_normals = F.pad(calculated_normals, (0, 0, 0, 1, 0, 1), mode='replicate')  # [C, H, W, 3]
+        calculated_normals = F.normalize(calculated_normals, dim=-1)
+     
+        # Set normals to zero where depths are zero
+        calculated_normals[no_intersection_mask] = 0
+        
+        # Assert that mask indices sum up to image pixels
+        __a = torch.sum(no_intersection_mask)
+        __b = torch.sum(angle_mask)
+        __c = torch.sum(otherwise)
+        assert __a + __b + __c == C * height * width, f'{__a + __b + __c} != {C * height * width}'
+        # Assert that masks are disjoint
+        assert torch.logical_not((torch.logical_and(no_intersection_mask, angle_mask)).any()), 'no_intersection_mask and angle_mask are not disjoint'
+        assert torch.logical_not((torch.logical_and(no_intersection_mask, otherwise)).any()), 'no_intersection_mask and otherwise are not disjoint'
+        assert torch.logical_not((torch.logical_and(angle_mask, otherwise)).any()), 'angle_mask and otherwise are not disjoint'
+        
         if DEBUG_DEPTH_MASKS:
             import matplotlib.pyplot as plt
-            
+ 
             # Convert masks to numpy arrays
             no_intersection_mask_np = no_intersection_mask.cpu().numpy()  # [C, H, W]
             angle_mask_np = angle_mask.cpu().numpy()  # [C, H, W]
@@ -676,7 +692,7 @@ def rasterization(
             num_images = no_intersection_mask_np.shape[0]
 
             # Create a figure with subplots
-            fig, axes = plt.subplots(num_images, 3, figsize=(15, 5 * num_images))
+            _, axes = plt.subplots(num_images, 3, figsize=(15, 5 * num_images))
 
             for i in range(num_images):
                 # Plot no_intersection_mask images
@@ -693,24 +709,45 @@ def rasterization(
                 axes[i, 2].imshow(otherwise_np[i], cmap='gray', vmin=0, vmax=1)
                 axes[i, 2].set_title(f'Otherwise Mask - {i}')
                 axes[i, 2].axis('off')
-
-            # Assert that mask indices sum up to image pixels
-            __a = torch.sum(no_intersection_mask)
-            __b = torch.sum(angle_mask)
-            __c = torch.sum(otherwise)
-            assert __a + __b + __c == C * height * width, f'{__a + __b + __c} != {C * height * width}'
-            # Assert that masks are disjoint
-            assert torch.logical_not((torch.logical_and(no_intersection_mask, angle_mask)).any()), 'no_intersection_mask and angle_mask are not disjoint'
-            assert torch.logical_not((torch.logical_and(no_intersection_mask, otherwise)).any()), 'no_intersection_mask and otherwise are not disjoint'
-            assert torch.logical_not((torch.logical_and(angle_mask, otherwise)).any()), 'angle_mask and otherwise are not disjoint'
+                
+            plt.tight_layout()
+            plt.show()
             
-        if DEBUG_DEPTH or DEBUG_DEPTH_MASKS:
+        if DEBUG_NORMAL_AND_DEPTH:
+            import matplotlib.pyplot as plt
+
+            # Create a figure with subplots
+            _, axes = plt.subplots(3, 1, figsize=(15, 5))
+
+            # Plot depth
+            debug_depth = depths[0].detach().cpu().numpy()  # [C, H, W]
+            debug_depth = debug_depth / debug_depth.max()
+            axes[0].imshow(debug_depth, cmap='gray', vmin=0, vmax=1)
+            axes[0].set_title(f'Normal dependant depth')
+            axes[0].axis('off')     
+            
+            # Plot calculated normals
+            debug_cal_norm = calculated_normals[0].detach().cpu().numpy()
+            axes[1].imshow(debug_cal_norm, vmin=-1, vmax=1)
+            axes[1].set_title(f'Calculated normals')
+            axes[1].axis('off') 
+            
+            # Plot rasterized normals
+            debug_cal_norm = rasterized_normals[0].detach().cpu().numpy()
+            axes[2].imshow(debug_cal_norm, vmin=-1, vmax=1)
+            axes[2].set_title(f'Rasterized normals')
+            axes[2].axis('off') 
+                
             plt.tight_layout()
             plt.show()
         
         # Update render_colors
-        render_colors[..., 3] = depths.squeeze(-1)
-        render_colors[..., 4:7] = normals
+        colors = render_colors[..., 0:3]
+        render_colors = torch.zeros((C, height, width, 10)).float().to(device)
+        render_colors[..., 0:3] = colors
+        render_colors[..., 3:4] = depths
+        render_colors[..., 4:7] = rasterized_normals
+        render_colors[..., 7:10] = calculated_normals
         
     if render_mode in ["ED", "RGB+ED"]:
         # normalize the accumulated depth to get the expected depth

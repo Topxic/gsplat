@@ -110,6 +110,7 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     uint32_t tr = block.thread_rank();
 
     S pix_out[COLOR_DIM] = {0.f};
+    bool depth_and_normal_set = false;
     for (uint32_t b = 0; b < num_batches; ++b) {
         // resync all threads before beginning next batch
         // end early if entire tile is done
@@ -163,7 +164,7 @@ __global__ void rasterize_to_pixels_fwd_kernel(
             for (uint32_t k = 0; k < 3; ++k) {
                 pix_out[k] += c_ptr[k] * vis;
             }
-            if (pix_out[3] == 0.f && opac > 0.7f) {
+            if (!depth_and_normal_set && opac > 0.60653065971f) {  // TODO Extract parameter (e^{-0.5})
                 // Set position to position of closest opaque gaussian
                 pix_out[3] = c_ptr[3];
                 pix_out[4] = c_ptr[4];
@@ -172,6 +173,7 @@ __global__ void rasterize_to_pixels_fwd_kernel(
                 pix_out[6] = c_ptr[6];
                 pix_out[7] = c_ptr[7];
                 pix_out[8] = c_ptr[8];
+                depth_and_normal_set = true;
             }
 
             cur_idx = batch_start + t;

@@ -114,6 +114,7 @@ __global__ void rasterize_to_pixels_bwd_kernel(
     S v_render_c[COLOR_DIM];
     GSPLAT_PRAGMA_UNROLL
     for (uint32_t k = 0; k < COLOR_DIM; ++k) {
+        // RGB+D+N mode: Color [0-3), position [3,6), normal [6,9)
         v_render_c[k] = v_render_colors[pix_id * COLOR_DIM + k];
     }
     const S v_render_a = v_render_alphas[pix_id];
@@ -196,12 +197,12 @@ __global__ void rasterize_to_pixels_bwd_kernel(
                 // update v_rgb for this gaussian
                 const S fac = alpha * T;
                 GSPLAT_PRAGMA_UNROLL
-                for (uint32_t k = 0; k < COLOR_DIM; ++k) {
+                for (uint32_t k = 0; k < 3; ++k) {
                     v_rgb_local[k] = fac * v_render_c[k];
                 }
                 // contribution from this pixel
                 S v_alpha = 0.f;
-                for (uint32_t k = 0; k < COLOR_DIM; ++k) {
+                for (uint32_t k = 0; k < 3; ++k) {
                     v_alpha +=
                         (rgbs_batch[t * COLOR_DIM + k] * T - buffer[k] * ra) *
                         v_render_c[k];
@@ -212,7 +213,7 @@ __global__ void rasterize_to_pixels_bwd_kernel(
                 if (backgrounds != nullptr) {
                     S accum = 0.f;
                     GSPLAT_PRAGMA_UNROLL
-                    for (uint32_t k = 0; k < COLOR_DIM; ++k) {
+                    for (uint32_t k = 0; k < 3; ++k) {
                         accum += backgrounds[k] * v_render_c[k];
                     }
                     v_alpha += -T_final * ra * accum;
@@ -236,7 +237,7 @@ __global__ void rasterize_to_pixels_bwd_kernel(
                 }
 
                 GSPLAT_PRAGMA_UNROLL
-                for (uint32_t k = 0; k < COLOR_DIM; ++k) {
+                for (uint32_t k = 0; k < 3; ++k) {
                     buffer[k] += rgbs_batch[t * COLOR_DIM + k] * fac;
                 }
             }
@@ -251,9 +252,14 @@ __global__ void rasterize_to_pixels_bwd_kernel(
                 int32_t g = id_batch[t]; // flatten index in [C * N] or [nnz]
                 S *v_rgb_ptr = (S *)(v_colors) + COLOR_DIM * g;
                 GSPLAT_PRAGMA_UNROLL
-                for (uint32_t k = 0; k < COLOR_DIM; ++k) {
+                for (uint32_t k = 0; k < 3; ++k) {
                     gpuAtomicAdd(v_rgb_ptr + k, v_rgb_local[k]);
                 }
+                // Set position and normal once 
+                //GSPLAT_PRAGMA_UNROLL
+                //for (uint32_t k = 3; k < 9; ++k) {
+                //    gpuAtomicAdd(v_rgb_ptr + k, v_render_colors[pix_id * COLOR_DIM + k]);
+                //}
 
                 S *v_conic_ptr = (S *)(v_conics) + 3 * g;
                 gpuAtomicAdd(v_conic_ptr, v_conic_local.x);
