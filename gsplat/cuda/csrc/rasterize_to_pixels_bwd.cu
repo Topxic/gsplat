@@ -34,8 +34,9 @@ __global__ void rasterize_to_pixels_bwd_kernel(
     const int32_t *__restrict__ tile_offsets, // [C, tile_height, tile_width]
     const int32_t *__restrict__ flatten_ids,  // [n_isects]
     // fwd outputs
-    const S *__restrict__ render_alphas,  // [C, image_height, image_width, 1]
-    const int32_t *__restrict__ last_ids, // [C, image_height, image_width]
+    const S *__restrict__ render_alphas,    // [C, image_height, image_width, 1]
+    const int32_t *__restrict__ last_ids,   // [C, image_height, image_width]
+    const int32_t *__restrict__ normal_ids, // [C, image_height, image_width]
     // grad outputs
     const S *__restrict__ v_render_colors, // [C, image_height, image_width,
                                            // COLOR_DIM]
@@ -57,6 +58,7 @@ __global__ void rasterize_to_pixels_bwd_kernel(
     tile_offsets += camera_id * tile_height * tile_width;
     render_alphas += camera_id * image_height * image_width;
     last_ids += camera_id * image_height * image_width;
+    normal_ids += camera_id * image_height * image_width;
     v_render_colors += camera_id * image_height * image_width * COLOR_DIM;
     v_render_alphas += camera_id * image_height * image_width;
     if (backgrounds != nullptr) {
@@ -200,6 +202,16 @@ __global__ void rasterize_to_pixels_bwd_kernel(
                 for (uint32_t k = 0; k < 3; ++k) {
                     v_rgb_local[k] = fac * v_render_c[k];
                 }
+
+                // If current gaussian was selected for normal pass through gradient
+                if (id_batch[t] == normal_ids[pix_id]) {
+                    // printf("id_batch[t]: %i, pix_id: %i, t: %i, normal_ids[pix_id]: %i\n", id_batch[t], pix_id, t, normal_ids[pix_id]);
+                    GSPLAT_PRAGMA_UNROLL
+                    for (uint32_t k = 3; k < 9; ++k) {
+                        v_rgb_local[k] = v_render_c[k];
+                    }
+                }
+
                 // contribution from this pixel
                 S v_alpha = 0.f;
                 for (uint32_t k = 0; k < 3; ++k) {
@@ -251,15 +263,11 @@ __global__ void rasterize_to_pixels_bwd_kernel(
             if (warp.thread_rank() == 0) {
                 int32_t g = id_batch[t]; // flatten index in [C * N] or [nnz]
                 S *v_rgb_ptr = (S *)(v_colors) + COLOR_DIM * g;
+
                 GSPLAT_PRAGMA_UNROLL
-                for (uint32_t k = 0; k < 3; ++k) {
+                for (uint32_t k = 0; k < COLOR_DIM; ++k) {
                     gpuAtomicAdd(v_rgb_ptr + k, v_rgb_local[k]);
                 }
-                // Set position and normal once 
-                //GSPLAT_PRAGMA_UNROLL
-                //for (uint32_t k = 3; k < 9; ++k) {
-                //    gpuAtomicAdd(v_rgb_ptr + k, v_render_colors[pix_id * COLOR_DIM + k]);
-                //}
 
                 S *v_conic_ptr = (S *)(v_conics) + 3 * g;
                 gpuAtomicAdd(v_conic_ptr, v_conic_local.x);
@@ -307,6 +315,7 @@ call_kernel_with_dim(
     // forward outputs
     const torch::Tensor &render_alphas, // [C, image_height, image_width, 1]
     const torch::Tensor &last_ids,      // [C, image_height, image_width]
+    const torch::Tensor &normal_ids,    // [C, image_height, image_width]
     // gradients of outputs
     const torch::Tensor &v_render_colors, // [C, image_height, image_width, 3]
     const torch::Tensor &v_render_alphas, // [C, image_height, image_width, 1]
@@ -323,6 +332,7 @@ call_kernel_with_dim(
     GSPLAT_CHECK_INPUT(flatten_ids);
     GSPLAT_CHECK_INPUT(render_alphas);
     GSPLAT_CHECK_INPUT(last_ids);
+    GSPLAT_CHECK_INPUT(normal_ids);
     GSPLAT_CHECK_INPUT(v_render_colors);
     GSPLAT_CHECK_INPUT(v_render_alphas);
     if (backgrounds.has_value()) {
@@ -395,6 +405,7 @@ call_kernel_with_dim(
                 flatten_ids.data_ptr<int32_t>(),
                 render_alphas.data_ptr<float>(),
                 last_ids.data_ptr<int32_t>(),
+                normal_ids.data_ptr<int32_t>(),
                 v_render_colors.data_ptr<float>(),
                 v_render_alphas.data_ptr<float>(),
                 absgrad ? reinterpret_cast<vec2<float> *>(
@@ -437,6 +448,7 @@ rasterize_to_pixels_bwd_tensor(
     // forward outputs
     const torch::Tensor &render_alphas, // [C, image_height, image_width, 1]
     const torch::Tensor &last_ids,      // [C, image_height, image_width]
+    const torch::Tensor &normal_ids,    // [C, image_height, image_width]
     // gradients of outputs
     const torch::Tensor &v_render_colors, // [C, image_height, image_width, 3]
     const torch::Tensor &v_render_alphas, // [C, image_height, image_width, 1]
@@ -463,6 +475,7 @@ rasterize_to_pixels_bwd_tensor(
             flatten_ids,                                                       \
             render_alphas,                                                     \
             last_ids,                                                          \
+            normal_ids,                                                        \
             v_render_colors,                                                   \
             v_render_alphas,                                                   \
             absgrad                                                            \

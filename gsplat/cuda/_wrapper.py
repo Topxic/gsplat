@@ -874,7 +874,7 @@ class _RasterizeToPixels(torch.autograd.Function):
         flatten_ids: Tensor,  # [n_isects]
         absgrad: bool,
     ) -> Tuple[Tensor, Tensor]:
-        render_colors, render_alphas, last_ids = _make_lazy_cuda_func(
+        render_colors, render_alphas, last_ids, normal_ids = _make_lazy_cuda_func(
             "rasterize_to_pixels_fwd"
         )(
             means2d,
@@ -901,6 +901,7 @@ class _RasterizeToPixels(torch.autograd.Function):
             flatten_ids,
             render_alphas,
             last_ids,
+            normal_ids,
         )
         ctx.width = width
         ctx.height = height
@@ -928,6 +929,7 @@ class _RasterizeToPixels(torch.autograd.Function):
             flatten_ids,
             render_alphas,
             last_ids,
+            normal_ids,
         ) = ctx.saved_tensors
         width = ctx.width
         height = ctx.height
@@ -954,6 +956,7 @@ class _RasterizeToPixels(torch.autograd.Function):
             flatten_ids,
             render_alphas,
             last_ids,
+            normal_ids,
             v_render_colors.contiguous(),
             v_render_alphas.contiguous(),
             absgrad,

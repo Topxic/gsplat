@@ -34,7 +34,8 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     const int32_t *__restrict__ flatten_ids,  // [n_isects]
     S *__restrict__ render_colors, // [C, image_height, image_width, COLOR_DIM]
     S *__restrict__ render_alphas, // [C, image_height, image_width, 1]
-    int32_t *__restrict__ last_ids // [C, image_height, image_width]
+    int32_t *__restrict__ last_ids, // [C, image_height, image_width]
+    int32_t *__restrict__ normal_ids // [C, image_height, image_width]
 ) {
     // each thread draws one pixel, but also timeshares caching gaussians in a
     // shared tile
@@ -50,6 +51,7 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     render_colors += camera_id * image_height * image_width * COLOR_DIM;
     render_alphas += camera_id * image_height * image_width;
     last_ids += camera_id * image_height * image_width;
+    normal_ids += camera_id * image_height * image_width;
     if (backgrounds != nullptr) {
         backgrounds += camera_id * COLOR_DIM;
     }
@@ -164,7 +166,7 @@ __global__ void rasterize_to_pixels_fwd_kernel(
             for (uint32_t k = 0; k < 3; ++k) {
                 pix_out[k] += c_ptr[k] * vis;
             }
-            if (!depth_and_normal_set && opac > 0.60653065971f) {  // TODO Extract parameter (e^{-0.5})
+            if (!depth_and_normal_set && alpha > 0.60653065971f) {  // TODO Extract parameter (e^{-0.5})
                 // Set position to position of closest opaque gaussian
                 pix_out[3] = c_ptr[3];
                 pix_out[4] = c_ptr[4];
@@ -173,6 +175,9 @@ __global__ void rasterize_to_pixels_fwd_kernel(
                 pix_out[6] = c_ptr[6];
                 pix_out[7] = c_ptr[7];
                 pix_out[8] = c_ptr[8];
+                // Save gaussian index for backward pass
+                normal_ids[pix_id] = g;
+                // Normal and position are set for this pixel once
                 depth_and_normal_set = true;
             }
 
@@ -201,7 +206,7 @@ __global__ void rasterize_to_pixels_fwd_kernel(
 }
 
 template <uint32_t CDIM>
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> call_kernel_with_dim(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> call_kernel_with_dim(
     // Gaussian parameters
     const torch::Tensor &means2d,   // [C, N, 2] or [nnz, 2]
     const torch::Tensor &conics,    // [C, N, 3] or [nnz, 3]
@@ -255,6 +260,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> call_kernel_with_dim(
     torch::Tensor last_ids = torch::empty(
         {C, image_height, image_width}, means2d.options().dtype(torch::kInt32)
     );
+    torch::Tensor normal_ids = torch::empty(
+        {C, image_height, image_width}, means2d.options().dtype(torch::kInt32)
+    );
 
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
     const uint32_t shared_mem =
@@ -297,13 +305,14 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> call_kernel_with_dim(
             flatten_ids.data_ptr<int32_t>(),
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
-            last_ids.data_ptr<int32_t>()
+            last_ids.data_ptr<int32_t>(),
+            normal_ids.data_ptr<int32_t>()
         );
 
-    return std::make_tuple(renders, alphas, last_ids);
+    return std::make_tuple(renders, alphas, last_ids, normal_ids);
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 rasterize_to_pixels_fwd_tensor(
     // Gaussian parameters
     const torch::Tensor &means2d,   // [C, N, 2] or [nnz, 2]
