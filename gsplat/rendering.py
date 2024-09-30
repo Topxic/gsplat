@@ -593,21 +593,25 @@ def rasterization(
         # Obtain positions and normals after rasterization
         rasterized_normals = render_colors[..., -3:]  # [C, H, W, 3], per pixel world space gaussian disk normals
         rasterized_positions = render_colors[..., -6:-3]  # [C, H, W, 3] (p_j^r), per pixel world space gaussian disk positions
-        
+
         # Calculate per-pixel view-rays
         cam_to_world: torch.Tensor = torch.linalg.pinv(viewmats)  # [C, 4, 4] (T_g)
-        rot = viewmats[:, :3, :3]  # [C, 3, 3] (R_g)
+        rot = cam_to_world[:, :3, :3]  # [C, 3, 3] (R_g)
         trans = cam_to_world[:, :3, 3]  # [C, 3] (t_g)
         Ks_inv: torch.Tensor = torch.linalg.pinv(Ks)  # [C, 3, 3] (K^{-1})
         v_coords, u_coords = torch.meshgrid(  # [H], [W]
             torch.arange(height, device=device), 
             torch.arange(width, device=device),
             indexing='ij')
-        image_coords = torch.stack([v_coords, u_coords, torch.ones_like(u_coords)], dim=-1).float()  # [H, W, 3]
+        image_coords = torch.stack([u_coords, v_coords, torch.ones_like(u_coords)], dim=-1).float()  # [H, W, 3]
         image_coords = image_coords.unsqueeze(0).expand(C, -1, -1, -1)  # [C, H, W, 3]
-        ray_dir_cam_space = torch.einsum('cij,chwj->chwi', Ks_inv.permute(0, 2, 1), image_coords)  # [C, H, W, 3]
-        ray_dir_world_space = torch.einsum('cij,chwj->chwi', rot.permute(0, 2, 1), ray_dir_cam_space)  # [C, H, W, 3] (R_g K^{-1}u)
-        ray_dir = F.normalize(-ray_dir_world_space, dim=-1)
+        #print(f'principle point image space: {image_coords[0, 239, 682]}')
+        ray_dir_cam_space = torch.einsum('cij,chwi->chwj', Ks_inv.permute([0, 2, 1]), image_coords)  # [C, H, W, 3]
+        ray_dir_cam_space = ray_dir_cam_space / ray_dir_cam_space[..., 2:3] 
+        #print(f'principle point camera space: {ray_dir_cam_space[0, 239, 682]}')
+        ray_dir_world_space = torch.einsum('cij,chwi->chwj', rot.permute([0, 2, 1]), ray_dir_cam_space)  # [C, H, W, 3] (R_g K^{-1}u)
+        ray_dir = F.normalize(ray_dir_world_space, dim=-1)
+        #print(f'principle point world space: {ray_dir[0, 239, 682]}')
 
         # Homogenize rasterized_positions vectors
         ones = torch.ones(C, height, width, 1).float().cuda()
@@ -619,18 +623,19 @@ def rasterization(
         trans = trans.unsqueeze(1).unsqueeze(1).expand(C, height, width, -1)  # [C, H, W, 3] (t_g)
         ray_length_count = rasterized_positions.clone()
         ray_length_count = ray_length_count - trans
-        ray_length_count = ray_length_count * rasterized_normals.clone()
-        ray_length_count = torch.sum(ray_length_count, dim=-1)  # [C, H, W, 1] (theta_u)
+        ray_length_count = torch.sum(ray_length_count * rasterized_normals.clone(), dim=-1, keepdim=True)  # [C, H, W, 1] (theta_u)
+        ray_length_count = torch.abs(ray_length_count)
         
         # Denominator of ray plane intersection
-        ray_dir_dot_normal = ray_dir.clone() * rasterized_normals.clone()
-        ray_dir_dot_normal = torch.sum(ray_dir_dot_normal, dim=-1)
-        ray_length_denom = ray_dir_dot_normal
+        ray_dir_dot_normal = torch.sum(ray_dir.clone() * rasterized_normals.clone(), dim=-1, keepdim=True)
+        ray_dir_dot_normal = torch.abs(ray_dir_dot_normal)
+
+        ray_length_denom = ray_dir_dot_normal.clone()
         # Prevent nan values even if they are masked out
         ray_length_denom[ray_length_denom == 0] = 1e-8
         ray_length = ray_length_count / ray_length_denom
         
-        intersections = ray_dir.clone() * ray_length.unsqueeze(-1) + trans  # [C, H, W, 3] (p_{G_j^r,r})
+        intersections = ray_dir.clone() * ray_length + trans  # [C, H, W, 3] (p_{G_j^r,r})
         
         # Homogenize intersection vectors
         intersections_h = torch.cat((intersections, ones), dim=-1)
@@ -639,37 +644,56 @@ def rasterization(
         
         # Set depth to -1 where no intersection happened (= normal is 0)
         no_intersection_mask = rasterized_normals.norm(dim=-1) == 0
-        # Only set if angle between normal and ray_dir < 60 degrees
-        angle_mask = torch.acos(ray_dir_dot_normal) < (depth_by_view_ray_disk_intersection_angle_threshold * math.pi / 180)
-        # Exclude pixels that didn't hit a gaussian
-        angle_mask = torch.logical_and(angle_mask, torch.logical_not(no_intersection_mask))
+        # Only set if angle between normal and ray_dir < threshold degrees
+        # This check implies the check for a zero denominator
+        angle_mask = (ray_dir_dot_normal >= 0.1).squeeze(-1)
+        intersections_mask = torch.logical_and(angle_mask, torch.logical_not(no_intersection_mask))
         # Otherwise
-        otherwise = torch.logical_not(torch.logical_or(no_intersection_mask, angle_mask))
+        otherwise = torch.logical_not(torch.logical_or(no_intersection_mask, intersections_mask))
         
         # Calculate and set depths according to masks
         depths = torch.zeros((C, height, width, 1), device=device).float()  # [C, H, W, 1]
         depths[no_intersection_mask] = -1
         intersections_img_space = torch.einsum('cij,chwj->chwi', viewmats, intersections_h)
-        depths[angle_mask.unsqueeze(-1)] = intersections_img_space[angle_mask][:, 2]  # (T^{-1}_g * p_{G_j^r,r}).z
+        depths[intersections_mask] = (intersections_img_space[intersections_mask][:, 2]).unsqueeze(-1)  # (T^{-1}_g * p_{G_j^r,r}).z
         positions_image_space = torch.einsum('cij,chwj->chwi', viewmats, positions_h)
-        depths[otherwise.unsqueeze(-1)] = positions_image_space[otherwise][:, 2]  # (T^{-1}_g * p_j^r).z 
+        depths[otherwise] = (positions_image_space[otherwise][:, 2]).unsqueeze(-1)  # (T^{-1}_g * p_j^r).z 
         
-        # Project pixel depths to world space coordinates
-        depths_world_space = ray_dir * depths + trans
-        
-        # Calculate the gradient of the 3D positions
-        dx = F.normalize(depths_world_space[:, 1:, :-1, :] - depths_world_space[:, :-1, :-1, :], dim=-1)
-        dy = F.normalize(depths_world_space[:, :-1, 1:, :] - depths_world_space[:, :-1, :-1, :], dim=-1)
-        
-        # Compute normals via cross product of dx and dy
-        calculated_normals = torch.cross(dx, dy, dim=-1)  # [C, H-1, W-1, 3]
-        calculated_normals = F.pad(calculated_normals, (0, 0, 0, 1, 0, 1), mode='replicate')  # [C, H, W, 3]
+        # Define Sobel filter kernels for x and y gradients
+        sobel_x = torch.tensor([[-1, 0, 1],
+                                [-2, 0, 2],
+                                [-1, 0, 1]]).unsqueeze(0).unsqueeze(0).float().cuda()
+        sobel_y = torch.tensor([[-1, -2, -1],
+                                [ 0,  0,  0],
+                                [ 1,  2,  1]]).unsqueeze(0).unsqueeze(0).float().cuda()
+
+        # Permute depths to match expected shape for convolution [C, 1, H, W]
+        depths_2d_conv = depths.permute(0, 3, 1, 2)
+
+        # Apply Sobel filters to compute dx and dy
+        dx = F.conv2d(depths_2d_conv, sobel_x, padding=1)  # [C, 1, H, W]
+        dy = F.conv2d(depths_2d_conv, sobel_y, padding=1)  # [C, 1, H, W]
+        # Camera looks in z-direction
+        dz = torch.full_like(dx, 1e-8)
+        calculated_normals = torch.cat([-dx, -dy, dz], dim=1)  # [C, 3, H, W]
+        calculated_normals = calculated_normals.permute(0, 2, 3, 1)  # [C, H, W, 3]
         calculated_normals = F.normalize(calculated_normals, dim=-1)
         
+        # # Project pixel depths to world space coordinates
+        # depths_world_space = ray_dir * depths + trans
+        # 
+        # # Calculate the gradient of the 3D positions
+        # dx = depths_world_space[:, 1:, :-1, :] - depths_world_space[:, :-1, :-1, :]
+        # dy = depths_world_space[:, :-1, 1:, :] - depths_world_space[:, :-1, :-1, :]
+        # # Compute normals via cross product of dx and dy
+        # calculated_normals = torch.cross(dx, dy, dim=-1)  # [C, H-1, W-1, 3]
+        # calculated_normals = F.pad(calculated_normals, (0, 0, 0, 1, 0, 1), mode='replicate')  # [C, H, W, 3]
+        # calculated_normals = F.normalize(calculated_normals, dim=-1)
+        
         # Rotate normals by camera rotation
-        rot_norm = torch.inverse(viewmats[:, :3, :3])
-        rot_norm = torch.transpose(rot_norm, 2, 1)
-        calculated_normals = torch.einsum('cij,chwj->chwi', rot_norm, calculated_normals)
+        rot_norm = torch.linalg.pinv(viewmats)[:, :3, :3] 
+        rot_norm = rot_norm.permute([0, 2, 1])
+        calculated_normals = torch.einsum('cij,chwi->chwj', rot_norm, calculated_normals)
         
         # Set normals to zero where depths are zero
         calculated_normals[no_intersection_mask] = 0
@@ -686,64 +710,75 @@ def rasterization(
             assert torch.logical_not((torch.logical_and(angle_mask, otherwise)).any()), 'angle_mask and otherwise are not disjoint'
         
         if DEBUG_DEPTH_MASKS:
-            import matplotlib.pyplot as plt
- 
-            # Convert masks to numpy arrays
-            no_intersection_mask_np = no_intersection_mask.cpu().numpy()  # [C, H, W]
-            angle_mask_np = angle_mask.cpu().numpy()  # [C, H, W]
-            otherwise_np = otherwise.cpu().numpy()  # [C, H, W]
-
-            # Number of images per mask
-            num_images = no_intersection_mask_np.shape[0]
+            import matplotlib.pyplot as plt            
 
             # Create a figure with subplots
-            _, axes = plt.subplots(3, 1, figsize=(5 * num_images, 15))
+            _, axes = plt.subplots(4, 3, figsize=(15, 5))
 
             # Plot no_intersection_mask images
-            axes[0].imshow(no_intersection_mask_np[0], cmap='gray', vmin=0, vmax=1)
-            axes[0].set_title(f'No Intersection Mask')
-            axes[0].axis('off')
+            no_intersection_mask_np = no_intersection_mask.cpu().numpy()  # [C, H, W]
+            axes[0, 0].imshow(no_intersection_mask_np[0], cmap='gray', vmin=0, vmax=1)
+            axes[0, 0].set_title(f'No Intersection')
+            axes[0, 0].axis('off')
             
             # Plot angle_mask images
-            axes[1].imshow(angle_mask_np[0], cmap='gray', vmin=0, vmax=1)
-            axes[1].set_title(f'Angle Mask')
-            axes[1].axis('off')
+            angle_mask_np = angle_mask.cpu().numpy()
+            axes[0, 1].imshow(angle_mask_np[0], cmap='gray', vmin=0, vmax=1)
+            axes[0, 1].set_title(f'ray_dir_dot_normal greater than threshold')
+            axes[0, 1].axis('off')
             
             # Plot otherwise images
-            axes[2].imshow(otherwise_np[0], cmap='gray', vmin=0, vmax=1)
-            axes[2].set_title(f'Otherwise Mask')
-            axes[2].axis('off')
-                
-            plt.tight_layout()
-            plt.show()
+            otherwise_np = otherwise.cpu().numpy()  # [C, H, W]
+            axes[1, 0].imshow(otherwise_np[0], cmap='gray', vmin=0, vmax=1)
+            axes[1, 0].set_title(f'Otherwise')
+            axes[1, 0].axis('off')
             
-        if DEBUG_NORMAL_AND_DEPTH:
-            import matplotlib.pyplot as plt
-
-            # Create a figure with subplots
-            _, axes = plt.subplots(3, 1, figsize=(15, 5))
-
             # Plot depth
             debug_depth = depths[0].detach().cpu().numpy()  # [C, H, W]
-            debug_depth[debug_depth < 0] = 0
-            debug_depth = debug_depth / debug_depth.max()
-            axes[0].imshow(debug_depth, cmap='gray', vmin=0, vmax=1)
-            axes[0].set_title(f'Normal dependant depth')
-            axes[0].axis('off')     
+            debug_depth = (debug_depth - debug_depth.min()) / (debug_depth.max() - debug_depth.min())
+            axes[1, 1].imshow(debug_depth, cmap='gray', vmin=0, vmax=1)
+            axes[1, 1].set_title(f'Depth by view ray disk intersection')
+            axes[1, 1].axis('off')     
             
             # Plot calculated normals
             debug_cal_norm = calculated_normals[0].detach().cpu().numpy()
-            debug_cal_norm = (debug_cal_norm + 1) / 2
-            axes[1].imshow(debug_cal_norm, vmin=-1, vmax=1)
-            axes[1].set_title(f'Calculated normals')
-            axes[1].axis('off') 
+            axes[1, 2].imshow(debug_cal_norm, vmin=-1, vmax=1)
+            axes[1, 2].set_title(f'Calculated normals')
+            axes[1, 2].axis('off') 
+            
+            # Plot flipped calculated normals
+            axes[2, 0].imshow(-debug_cal_norm, vmin=-1, vmax=1)
+            axes[2, 0].set_title(f'Flipped Calculated normals')
+            axes[2, 0].axis('off') 
             
             # Plot rasterized normals
             debug_ras_norm = rasterized_normals[0].detach().cpu().numpy()
-            debug_ras_norm = (debug_ras_norm + 1) / 2
-            axes[2].imshow(debug_ras_norm, vmin=-1, vmax=1)
-            axes[2].set_title(f'Rasterized normals')
-            axes[2].axis('off') 
+            axes[2, 1].imshow(debug_ras_norm, vmin=-1, vmax=1)
+            axes[2, 1].set_title(f'Rasterized normals')
+            axes[2, 1].axis('off') 
+            
+            # Plot flipped rasterized normals
+            debug_flipped_ras_norm = -debug_ras_norm
+            axes[2, 2].imshow(debug_flipped_ras_norm, vmin=-1, vmax=1)
+            axes[2, 2].set_title(f'Flipped rasterized normals')
+            axes[2, 2].axis('off') 
+            
+            # Plot absolute ray view dot normal
+            ray_dir_dot_normal_np = ray_dir_dot_normal[0].detach().cpu().numpy()
+            axes[3, 0].imshow(ray_dir_dot_normal_np, cmap='gray', vmin=0, vmax=1)
+            axes[3, 0].set_title(f'Ray view dot normal')
+            axes[3, 0].axis('off') 
+            
+            # Plot ray dirs
+            ray_dir_np = ray_dir[0].detach().cpu().numpy()
+            axes[3, 1].imshow(ray_dir_np, vmin=-1, vmax=1)
+            axes[3, 1].set_title(f'Ray view direction')
+            axes[3, 1].axis('off') 
+            
+            # Plot flipped ray dirs
+            axes[3, 2].imshow(-ray_dir_np, vmin=-1, vmax=1)
+            axes[3, 2].set_title(f'Flipped ray view direction')
+            axes[3, 2].axis('off') 
                 
             plt.tight_layout()
             plt.show()
