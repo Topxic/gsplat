@@ -35,7 +35,8 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     S *__restrict__ render_colors, // [C, image_height, image_width, COLOR_DIM]
     S *__restrict__ render_alphas, // [C, image_height, image_width, 1]
     int32_t *__restrict__ last_ids, // [C, image_height, image_width]
-    int32_t *__restrict__ normal_ids // [C, image_height, image_width]
+    int32_t *__restrict__ normal_ids, // [C, image_height, image_width]
+    const float surface_alpha
 ) {
     // each thread draws one pixel, but also timeshares caching gaussians in a
     // shared tile
@@ -166,7 +167,7 @@ __global__ void rasterize_to_pixels_fwd_kernel(
             for (uint32_t k = 0; k < 3; ++k) {
                 pix_out[k] += c_ptr[k] * vis;
             }
-            if (!depth_and_normal_set && alpha > 0.60653065971f) {  // TODO Extract parameter (e^{-0.5})
+            if (!depth_and_normal_set && alpha >= surface_alpha) {
                 // Set position to position of closest opaque gaussian
                 pix_out[3] = c_ptr[3];
                 pix_out[4] = c_ptr[4];
@@ -220,7 +221,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> call_kern
     const uint32_t tile_size,
     // intersections
     const torch::Tensor &tile_offsets, // [C, tile_height, tile_width]
-    const torch::Tensor &flatten_ids   // [n_isects]
+    const torch::Tensor &flatten_ids,   // [n_isects]
+    const float surface_alpha
 ) {
     GSPLAT_DEVICE_GUARD(means2d);
     GSPLAT_CHECK_INPUT(means2d);
@@ -306,7 +308,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> call_kern
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             last_ids.data_ptr<int32_t>(),
-            normal_ids.data_ptr<int32_t>()
+            normal_ids.data_ptr<int32_t>(),
+            surface_alpha
         );
 
     return std::make_tuple(renders, alphas, last_ids, normal_ids);
@@ -326,8 +329,9 @@ rasterize_to_pixels_fwd_tensor(
     const uint32_t image_height,
     const uint32_t tile_size,
     // intersections
-    const torch::Tensor &tile_offsets, // [C, tile_height, tile_width]
-    const torch::Tensor &flatten_ids   // [n_isects]
+    const torch::Tensor &tile_offsets,  // [C, tile_height, tile_width]
+    const torch::Tensor &flatten_ids,   // [n_isects]
+    const float surface_alpha
 ) {
     GSPLAT_CHECK_INPUT(colors);
     uint32_t channels = colors.size(-1);
@@ -345,7 +349,8 @@ rasterize_to_pixels_fwd_tensor(
             image_height,                                                      \
             tile_size,                                                         \
             tile_offsets,                                                      \
-            flatten_ids                                                        \
+            flatten_ids,                                                       \
+            surface_alpha                                                      \
         );
 
     // TODO: an optimization can be done by passing the actual number of
