@@ -521,7 +521,7 @@ def rasterize_to_pixels(
         tile_width * tile_size >= image_width
     ), f"Assert Failed: {tile_width} * {tile_size} >= {image_width}"
 
-    render_colors, render_alphas = _RasterizeToPixels.apply(
+    render_colors, render_alphas, first_ids = _RasterizeToPixels.apply(
         means2d.contiguous(),
         conics.contiguous(),
         colors.contiguous(),
@@ -536,10 +536,13 @@ def rasterize_to_pixels(
         absgrad,
         surface_alpha,
     )
+    
+    assert first_ids.min() >= -1, first_ids.min()
+    assert first_ids.max() < means2d.shape[1], first_ids.max()  # < N
 
     if padded_channels > 0:
         render_colors = render_colors[..., :-padded_channels]
-    return render_colors, render_alphas
+    return render_colors, render_alphas, first_ids
 
 
 @torch.no_grad()
@@ -877,8 +880,8 @@ class _RasterizeToPixels(torch.autograd.Function):
         flatten_ids: Tensor,  # [n_isects]
         absgrad: bool,
         surface_alpha: float,
-    ) -> Tuple[Tensor, Tensor]:
-        render_colors, render_alphas, last_ids, normal_ids = _make_lazy_cuda_func(
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        render_colors, render_alphas, last_ids, first_ids = _make_lazy_cuda_func(
             "rasterize_to_pixels_fwd"
         )(
             means2d,
@@ -906,7 +909,6 @@ class _RasterizeToPixels(torch.autograd.Function):
             flatten_ids,
             render_alphas,
             last_ids,
-            normal_ids,
         )
         ctx.width = width
         ctx.height = height
@@ -915,13 +917,14 @@ class _RasterizeToPixels(torch.autograd.Function):
 
         # double to float
         render_alphas = render_alphas.float()
-        return render_colors, render_alphas
+        return render_colors, render_alphas, first_ids
 
     @staticmethod
     def backward(
         ctx,
         v_render_colors: Tensor,  # [C, H, W, 3]
         v_render_alphas: Tensor,  # [C, H, W, 1]
+        v_first_ids: Tensor,  # [C, H, W, 1]
     ):
         (
             means2d,
@@ -934,7 +937,6 @@ class _RasterizeToPixels(torch.autograd.Function):
             flatten_ids,
             render_alphas,
             last_ids,
-            normal_ids,
         ) = ctx.saved_tensors
         width = ctx.width
         height = ctx.height
@@ -961,7 +963,7 @@ class _RasterizeToPixels(torch.autograd.Function):
             flatten_ids,
             render_alphas,
             last_ids,
-            normal_ids,
+            v_first_ids.contiguous(),
             v_render_colors.contiguous(),
             v_render_alphas.contiguous(),
             absgrad,

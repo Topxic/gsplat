@@ -35,7 +35,7 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     S *__restrict__ render_colors, // [C, image_height, image_width, COLOR_DIM]
     S *__restrict__ render_alphas, // [C, image_height, image_width, 1]
     int32_t *__restrict__ last_ids, // [C, image_height, image_width]
-    int32_t *__restrict__ normal_ids, // [C, image_height, image_width]
+    int32_t *__restrict__ first_ids, // [C, image_height, image_width]
     const float surface_alpha
 ) {
     // each thread draws one pixel, but also timeshares caching gaussians in a
@@ -52,7 +52,7 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     render_colors += camera_id * image_height * image_width * COLOR_DIM;
     render_alphas += camera_id * image_height * image_width;
     last_ids += camera_id * image_height * image_width;
-    normal_ids += camera_id * image_height * image_width;
+    first_ids += camera_id * image_height * image_width;
     if (backgrounds != nullptr) {
         backgrounds += camera_id * COLOR_DIM;
     }
@@ -177,7 +177,7 @@ __global__ void rasterize_to_pixels_fwd_kernel(
                 pix_out[7] = c_ptr[7];
                 pix_out[8] = c_ptr[8];
                 // Save gaussian index for backward pass
-                normal_ids[pix_id] = g;
+                first_ids[pix_id] = g / (camera_id + 1);
                 // Normal and position are set for this pixel once
                 depth_and_normal_set = true;
             }
@@ -262,8 +262,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> call_kern
     torch::Tensor last_ids = torch::empty(
         {C, image_height, image_width}, means2d.options().dtype(torch::kInt32)
     );
-    torch::Tensor normal_ids = torch::empty(
-        {C, image_height, image_width}, means2d.options().dtype(torch::kInt32)
+    torch::Tensor first_ids = torch::full(
+        {C, image_height, image_width}, -1, means2d.options().dtype(torch::kInt32)
     );
 
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
@@ -308,11 +308,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> call_kern
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             last_ids.data_ptr<int32_t>(),
-            normal_ids.data_ptr<int32_t>(),
+            first_ids.data_ptr<int32_t>(),
             surface_alpha
         );
 
-    return std::make_tuple(renders, alphas, last_ids, normal_ids);
+    return std::make_tuple(renders, alphas, last_ids, first_ids);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
