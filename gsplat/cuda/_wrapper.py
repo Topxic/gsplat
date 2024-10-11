@@ -419,6 +419,7 @@ def rasterize_to_pixels(
     masks: Optional[Tensor] = None,  # [C, tile_height, tile_width]
     packed: bool = False,
     absgrad: bool = False,
+    render_mode: str = 'RGB+D+N',
     surface_alpha: float = math.exp(-0.5)
 ) -> Tuple[Tensor, Tensor]:
     """Rasterizes Gaussians to pixels.
@@ -542,7 +543,11 @@ def rasterize_to_pixels(
 
     if padded_channels > 0:
         render_colors = render_colors[..., :-padded_channels]
-    return render_colors, render_alphas, first_ids
+        
+    if render_mode == 'RGB+D+N':
+        return render_colors, render_alphas, first_ids
+    else:
+        return render_colors, render_alphas
 
 
 @torch.no_grad()
