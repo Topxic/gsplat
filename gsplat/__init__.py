@@ -1,5 +1,7 @@
 import warnings
 
+from .examples import *
+
 from .compression import PngCompression
 from .cuda._torch_impl import accumulate
 from .cuda._wrapper import (

@@ -33,14 +33,14 @@ from gsplat.strategy import DefaultStrategy, MCMCStrategy
 @dataclass
 class Config:
     # Disable viewer
-    disable_viewer: bool = False
+    disable_viewer: bool = True
     # Path to the .pt file. If provide, it will skip training and render a video
     ckpt: Optional[str] = None
     # Name of compression strategy to use
     compression: Optional[Literal["png"]] = None
 
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "data/360_v2/garden"
+    data_dir: str = "/data/local/loob6631/360_v2/garden/"
     # Downsample factor for the dataset
     data_factor: int = 4
     # Directory to save results
@@ -56,12 +56,12 @@ class Config:
     port: int = 8080
 
     # Batch size for training. Learning rates are scaled automatically
-    batch_size: int = 1
+    batch_size: int = 3
     # A global factor to scale the number of training steps
     steps_scaler: float = 1.0
 
     # Number of training steps
-    max_steps: int = 30_000
+    max_steps: int = 1000
     # Steps to evaluate the model
     eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Steps to save the model
@@ -132,7 +132,7 @@ class Config:
     depth_lambda: float = 1e-2
 
     # Dump information to tensorboard every this steps
-    tb_every: int = 100
+    tb_every: int = 10
     # Save training images to tensorboard
     tb_save_image: bool = False
 
@@ -612,6 +612,7 @@ class Runner:
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
+                self.eval(step)
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
                 if cfg.tb_save_image:
