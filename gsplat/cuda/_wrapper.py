@@ -1251,14 +1251,16 @@ class _RasterizeToPixelsDisks(torch.autograd.Function):
         height = ctx.height
         tile_size = ctx.tile_size
         absgrad = ctx.absgrad
-
+        
+        #assert last_ids.max() < means2d.shape[1], f'{last_ids.max()} has to be < {means2d.shape[1]}'
+        
         (
             v_means2d_abs,
             v_means2d,
             v_conics,
             v_colors,
             v_opacities,
-        ) = _make_lazy_cuda_func("rasterize_to_pixels_disks_bwd")(
+        ) = _make_lazy_cuda_func("rasterize_to_pixels_bwd")(
             means2d,
             conics,
             colors,
@@ -1272,7 +1274,6 @@ class _RasterizeToPixelsDisks(torch.autograd.Function):
             flatten_ids,
             render_alphas,
             last_ids,
-            v_first_ids.contiguous(),
             v_render_colors.contiguous(),
             v_render_alphas.contiguous(),
             absgrad,

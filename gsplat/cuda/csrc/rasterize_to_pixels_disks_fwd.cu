@@ -113,7 +113,6 @@ __global__ void rasterize_to_pixels_disks_fwd_kernel(
     uint32_t tr = block.thread_rank();
 
     S pix_out[COLOR_DIM] = {0.f};
-    bool depth_and_normal_set = false;
     for (uint32_t b = 0; b < num_batches; ++b) {
         // resync all threads before beginning next batch
         // end early if entire tile is done
@@ -164,27 +163,22 @@ __global__ void rasterize_to_pixels_disks_fwd_kernel(
 
             // Render color via alpha blending
             GSPLAT_PRAGMA_UNROLL
-            for (uint32_t k = 0; k < 3; ++k) {
+            for (uint32_t k = 0; k < COLOR_DIM; ++k) {
                 pix_out[k] += c_ptr[k] * vis;
             }
-            if (!depth_and_normal_set && alpha >= surface_alpha) {
-                // Set position to position of closest opaque gaussian
-                pix_out[3] = c_ptr[3];
-                pix_out[4] = c_ptr[4];
-                pix_out[5] = c_ptr[5];
-                // Set normal to normal of closest opaque gaussian
-                pix_out[6] = c_ptr[6];
-                pix_out[7] = c_ptr[7];
-                pix_out[8] = c_ptr[8];
-                // Save gaussian index for backward pass
+
+            // If surface alpha is reached by a single gaussian disk this pixel is done
+            // Don't consider gaussians behind him
+            if (first_ids[pix_id] == -1 && alpha >= surface_alpha) {
                 first_ids[pix_id] = g / (camera_id + 1);
-                // Normal and position are set for this pixel once
-                depth_and_normal_set = true;
+                done = true;
+                break;
             }
 
             cur_idx = batch_start + t;
 
             T = next_T;
+
         }
     }
 
