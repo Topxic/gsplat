@@ -167,12 +167,9 @@ __global__ void rasterize_to_pixels_disks_fwd_kernel(
                 pix_out[k] += c_ptr[k] * vis;
             }
 
-            // If surface alpha is reached by a single gaussian disk this pixel is done
-            // Don't consider gaussians behind him
+            // If surface alpha is overstepped mark this gaussian as pixels normal
             if (first_ids[pix_id] == -1 && alpha >= surface_alpha) {
                 first_ids[pix_id] = g / (camera_id + 1);
-                done = true;
-                break;
             }
 
             cur_idx = batch_start + t;
