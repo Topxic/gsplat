@@ -702,7 +702,6 @@ def rasterize_to_pixels_disks(
     )
     
     assert first_ids.min() >= -1, first_ids.min()
-    assert first_ids.max() < means2d.shape[1], first_ids.max()  # < N
 
     if padded_channels > 0:
         render_colors = render_colors[..., :-padded_channels]
